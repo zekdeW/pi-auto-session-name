@@ -1,0 +1,25 @@
+{
+  "name": "pi-auto-session-name",
+  "version": "1.0.0",
+  "description": "pi coding agent 扩展：自动为会话生成标题，长对话随主题漂移实时更新（Auto session naming for pi）",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "session",
+    "naming",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zekdeW/pi-auto-session-name.git"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/auto-session-name.ts"]
+  }
+}
