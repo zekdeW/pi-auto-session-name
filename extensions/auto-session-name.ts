@@ -1,21 +1,24 @@
 /**
- * 自动会话命名（支持长对话实时更新）：
- * - 首轮对话结束后，用当前模型生成一个简短标题并设为会话名
- * - 之后每新增 RENAME_EVERY_N 条用户消息，自动复查一次：主题没变保留原标题，
- *   主题漂移则更新标题（并通知）
+ * 自动会话命名（主题集合版）：
+ * - 首轮对话结束后，用当前模型生成第一个主题
+ * - 之后每新增 RENAME_EVERY_N 条用户消息复查一次：主题没变保持不变；
+ *   出现新主题则追加；名字 = 各主题按出现顺序用 " / " 连接
+ *   （例：「自动最大化终端窗口 / 会话自动命名扩展」）
  * - 手动 /name 设置的名字不会被覆盖（通过会话内 custom entry 标记区分）
  * - 名称显示在 pi -r / /resume 的会话列表里
  *
- * 可用环境变量微调：PI_AUTO_NAME_EVERY=3  （每几条用户消息复查一次标题）
+ * 可用环境变量微调：PI_AUTO_NAME_EVERY=3（每几条用户消息复查一次）
  */
 import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const RENAME_EVERY_N = Math.max(1, Number(process.env.PI_AUTO_NAME_EVERY ?? 3));
+const MAX_TOPICS = 4; // 主题列表最多保留几个
+const TOPIC_LEN = 12; // 单个主题最大长度（字符）
+const JOINER = " / "; // 主题连接符
 const MAX_TEXT = 800; // 首轮命名时传给模型的单段内容上限（字符）
 const RECENT_CLIP = 300; // 复查时每条用户消息的截断上限
 const RECENT_COUNT = 4; // 复查时携带最近几条用户消息
-const MAX_TITLE = 24; // 标题最大长度
 const MARKER = "auto-session-name"; // 会话内标记的 customType
 
 const textOf = (content: unknown): string => {
@@ -32,46 +35,72 @@ const textOf = (content: unknown): string => {
 
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
-const cleanTitle = (raw: string): string => {
+/** 清洗单个主题：去掉编号、引号、前后缀和末尾标点，超长截断 */
+const cleanTopic = (raw: string): string => {
 	let t = raw.replace(/\s+/g, " ").trim();
+	t = t.replace(/^([-*•]|\d+[.、)]|[一二三四五六七八九十]+[、.])\s*/, "");
 	t = t.replace(/^[(《"'\u201c\u2018【[]+|[》"'\u201d\u2019】\]))]+$/g, "");
-	t = t.replace(/^(标题|题目|title|主题)\s*[:：]\s*/i, "");
-	t = t.replace(/[。.!！]+$/, "");
-	if (t.length > MAX_TITLE) t = `${t.slice(0, MAX_TITLE).trimEnd()}…`;
-	return t;
+	t = t.replace(/^(主题|题目|title|topic)\s*[:：]\s*/i, "");
+	t = t.replace(/[。.!！、；;，,]+$/, "");
+	if (t.length > TOPIC_LEN) t = `${t.slice(0, TOPIC_LEN).trimEnd()}…`;
+	return t.trim();
 };
+
+/** 把模型输出解析为主题列表：按行拆分、清洗、去重，超出上限舍弃最旧 */
+const parseTopics = (raw: string): string[] => {
+	const out: string[] = [];
+	for (const line of raw.split(/\r?\n/)) {
+		const t = cleanTopic(line);
+		if (t && !out.includes(t)) out.push(t);
+	}
+	return out.slice(-MAX_TOPICS);
+};
+
+const joinName = (topics: string[]): string => topics.filter(Boolean).join(JOINER);
 
 export default function (pi: ExtensionAPI) {
 	let inFlight = false; // 防止重入
 	let checkedCount = 0; // 上次命名/复查时的用户消息数
-	let autoName: string | undefined; // 我们自动设置的名字
+	let autoTopics: string[] | undefined; // 我们自动维护的主题列表
 	let manualName = false; // 用户手动命名过 → 停止自动命名
 
-	// ---- 会话加载时恢复状态（区分自动命名与手动命名） ----
+	// ---- 会话加载时恢复状态（区分自动命名与手动命名，兼容 v1.0 单标题标记） ----
 	pi.on("session_start", async (_event, ctx) => {
-		autoName = undefined;
+		autoTopics = undefined;
 		manualName = false;
 		checkedCount = 0;
-		let marker: string | undefined;
+		let markerTopics: string[] | undefined;
 		for (const entry of ctx.sessionManager.getEntries() as Array<{
 			type: string;
 			message?: { role?: string };
 			customType?: string;
-			data?: { name?: string };
+			data?: { name?: string; topics?: string[] };
 		}>) {
-			if (entry.type === "custom" && entry.customType === MARKER) marker = entry.data?.name;
-			else if (entry.type === "message" && entry.message?.role === "user") checkedCount++;
+			if (entry.type === "custom" && entry.customType === MARKER) {
+				markerTopics =
+					Array.isArray(entry.data?.topics) && entry.data.topics.length
+						? entry.data.topics
+						: entry.data?.name
+							? [entry.data.name]
+							: undefined;
+			} else if (entry.type === "message" && entry.message?.role === "user") {
+				checkedCount++;
+			}
 		}
 		const current = pi.getSessionName();
 		if (current) {
-			manualName = current !== marker;
-			autoName = manualName ? undefined : current;
+			if (markerTopics && joinName(markerTopics) === current) {
+				autoTopics = markerTopics;
+			} else {
+				manualName = true; // 有名字但不是我们自动维护的 → 视为手动
+			}
 		}
 	});
 
 	// ---- 用户手动 /name → 记住并停止自动命名 ----
 	pi.on("session_info_changed", async (event) => {
-		if (!event.name || event.name === autoName) return;
+		const ours = autoTopics ? joinName(autoTopics) : undefined;
+		if (!event.name || event.name === ours) return;
 		manualName = true;
 	});
 
@@ -122,18 +151,19 @@ export default function (pi: ExtensionAPI) {
 			.join("");
 	};
 
-	const applyName = (
+	const applyTopics = (
 		ctx: { hasUI: boolean; ui: { notify: (msg: string, level?: string) => void } },
-		title: string,
+		topics: string[],
 	): void => {
-		if (!title || title === pi.getSessionName()) return;
-		pi.setSessionName(title);
-		autoName = title;
-		pi.appendEntry(MARKER, { name: title });
-		if (ctx.hasUI) ctx.ui.notify(`已自动命名：${title}`, "info");
+		const name = joinName(topics);
+		if (!name || name === pi.getSessionName()) return;
+		pi.setSessionName(name);
+		autoTopics = topics;
+		pi.appendEntry(MARKER, { name, topics });
+		if (ctx.hasUI) ctx.ui.notify(`已更新命名：${name}`, "info");
 	};
 
-	// ---- 每轮对话结束后：首次命名 / 周期性复查 ----
+	// ---- 每轮对话结束后：首次命名 / 周期性复查主题列表 ----
 	pi.on("agent_end", async (_event, ctx) => {
 		if (manualName || inFlight) return;
 		inFlight = true;
@@ -142,29 +172,32 @@ export default function (pi: ExtensionAPI) {
 			const current = pi.getSessionName();
 
 			if (!current) {
-				// 首次命名
+				// 首次命名：生成第一个主题
 				if (!firstUser) return;
 				const prompt = [
-					"根据下面的对话开头，给这段对话起一个简短的标题。",
-					"要求：不超过 20 个字；标题语言与对话一致；直接输出标题本身，不要引号、句号或任何解释。",
+					"根据下面的对话开头，给这段对话起一个简短的主题标题。",
+					"要求：不超过 12 个字；标题语言与对话一致；直接输出标题本身，不要引号、编号、句号或任何解释。",
 					"",
 					"<对话>",
 					clip(firstUser, MAX_TEXT),
 					firstAssistant ? clip(firstAssistant, MAX_TEXT) : "",
 					"</对话>",
 				].join("\n");
-				const title = cleanTitle(await askModel(ctx, prompt)) || firstUser.replace(/\s+/g, " ").slice(0, 30);
+				const topics = parseTopics(await askModel(ctx, prompt));
 				checkedCount = recentUsers.length;
-				applyName(ctx, title);
-			} else if (autoName && recentUsers.length - checkedCount >= RENAME_EVERY_N) {
-				// 周期性复查：主题漂移才改名
+				applyTopics(ctx, topics.length ? topics : [firstUser.replace(/\s+/g, " ").slice(0, TOPIC_LEN)]);
+			} else if (autoTopics && recentUsers.length - checkedCount >= RENAME_EVERY_N) {
+				// 周期性复查：维护主题集合
+				const currentList = autoTopics.map((t, i) => `${i + 1}. ${t}`).join("\n");
 				const recent = recentUsers
 					.slice(-RECENT_COUNT)
 					.map((t, i) => `${i + 1}. ${clip(t, RECENT_CLIP)}`)
 					.join("\n");
 				const prompt = [
-					"这是一个进行中的对话，需要决定是否更新会话标题。",
-					`当前标题：${current}`,
+					"这是一个进行中的会话，需要维护它的「主题列表」（按主题在对话中出现的顺序排列）。",
+					"",
+					"当前主题列表：",
+					currentList,
 					"",
 					"对话最早的用户消息：",
 					clip(firstUser, RECENT_CLIP),
@@ -172,12 +205,16 @@ export default function (pi: ExtensionAPI) {
 					"最近的用户消息：",
 					recent,
 					"",
-					"判断当前标题是否仍然能概括整个对话：如果主题没有明显变化，原样输出当前标题；如果主题已经明显变化，输出一个新的、不超过 20 字的标题（语言与对话一致）。",
-					"直接输出标题本身，不要引号或任何解释。",
+					"请维护这个主题列表：",
+					"- 若最近的内容仍属于已有主题，保持列表不变（已有条目文字尽量原样保留）",
+					"- 若出现了明显的新主题，在列表末尾追加一个不超过 12 字的新条目",
+					"- 若两个条目明显是同一件事的不同叫法，可合并为一个",
+					"- 条目最多保留 4 个：若已满且有新主题，先尝试合并相近条目，否则舍弃最旧的",
+					"直接输出完整列表：每行一个主题，不要编号、引号或任何解释。",
 				].join("\n");
-				const title = cleanTitle(await askModel(ctx, prompt));
+				const topics = parseTopics(await askModel(ctx, prompt));
 				checkedCount = recentUsers.length;
-				if (title) applyName(ctx, title);
+				if (topics.length) applyTopics(ctx, topics);
 			}
 		} catch {
 			// 命名只是锦上添花，任何错误都静默忽略，不影响正常对话
