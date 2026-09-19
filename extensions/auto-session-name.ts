@@ -157,8 +157,11 @@ export default function (pi: ExtensionAPI) {
 	): void => {
 		const name = joinName(topics);
 		if (!name || name === pi.getSessionName()) return;
-		pi.setSessionName(name);
+		// 必须先更新 autoTopics 再 setSessionName：setSessionName 会同步触发
+		// session_info_changed，若 autoTopics 尚未更新，我们自己的改名会被
+		// 误判为用户手动命名，导致自动命名被永久禁用
 		autoTopics = topics;
+		pi.setSessionName(name);
 		pi.appendEntry(MARKER, { name, topics });
 		if (ctx.hasUI) ctx.ui.notify(`已更新命名：${name}`, "info");
 	};
